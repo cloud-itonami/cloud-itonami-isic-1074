@@ -1,0 +1,12 @@
+{:itonami.blueprint/id "cloud-itonami-1074"
+ :itonami.blueprint/name "Macaroni, Noodles, Couscous and Similar Farinaceous Products Coordination"
+ :itonami.blueprint/isic-rev5 "1074"
+ :itonami.blueprint/domain :food/macaroni-noodles-couscous
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:food-security :food-safety :fair-labor]
+ :itonami.blueprint/governor :pasta-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :cae]
+ :itonami.blueprint/optional-technologies [:optimization :telemetry]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented}
