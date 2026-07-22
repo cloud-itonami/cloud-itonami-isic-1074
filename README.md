@@ -4,6 +4,23 @@
 
 A distributed actor for autonomous, compliant coordination of macaroni/noodle/couscous manufacturing plant operations: batch formulation → extrusion → drying → moisture/weight inspection → allergen labeling → finished-product logistics. Sealed LLM advisor; independent Governor enforcement; append-only audit ledger. **Not equipment control.** Extruder/dryer operation and food-safety certification authority remain exclusive to licensed pasta plant staff and regulators.
 
+**Maturity: `:implemented`.** `src/pastaops/` implements the
+`PastaOpsAdvisor` (`pastaops.advisor`) and the independent Pasta Governor
+(`pastaops.governor`), composed by `pastaops.operation/build` following
+the itonami actor pattern: `intake -> advise -> govern -> decide ->
+commit | request-approval -> commit | hold`, compiled to a real
+`langgraph-clj` `StateGraph` (`langgraph.graph/state-graph` +
+`compile-graph`, mirroring `bakeryops.operation`, cloud-itonami-isic-1071)
+with `interrupt-before #{:request-approval}` and checkpoint-based
+human-in-the-loop resume for the two real actuation events
+(`:log-production-batch` / `:coordinate-shipment`) and food-safety
+concern flagging. Every commit/hold/approval-rejected decision fact is
+appended to `pastaops.store`'s append-only audit ledger
+(`ledger`/`append-ledger!`, `MemStore`). The demo runner
+(`clojure -M:dev:run`) drives the compiled graph end-to-end through a
+commit path, an escalate→approve→commit path, an escalate→reject→hold
+path, and a hard-hold path, printing the resulting audit ledger.
+
 ## Scope
 
 This actor coordinates **plant-operations workflow** for macaroni/noodle/couscous manufacturing:
@@ -60,26 +77,54 @@ Any proposal for an operation outside this allowlist — most importantly anythi
 
 Product-type extrusion/drying windows (`pastaops.facts/product-types`) cover macaroni (elbow), spaghetti, egg noodles, and couscous — each with its own drying temperature/time window and target moisture (post-drying moisture ceiling references CODEX STAN 249-2006, Standard for Dried Pasta, 12.5% m/m). Jurisdictions (`pastaops.facts/jurisdictions`) cover Japan (食品表示法・都道府県), the United States (FDA/FALCPA), and the European Union (EFSA), each with an allergen set and a required-evidence checklist (formulation record, extrusion log, drying log, moisture test, allergen declaration, weight check).
 
+## Module structure
+
+Mirrors `cloud-itonami-isic-1071` (`bakeryops.*`) module-for-module:
+
+- `pastaops.facts` — reference data: product-type extrusion/drying windows,
+  jurisdiction allergen/evidence requirements, ingredient allergen table
+- `pastaops.registry` — pure independent verification functions
+  (drying-temp/time/moisture/sanitation/calibration/weight/allergen)
+- `pastaops.store` — pure `{:batches ...}` value helpers PLUS a `Store`
+  protocol: batch staging/lookup + append-only audit ledger, implemented by
+  `MemStore` (in-memory, default)
+- `pastaops.advisor` — `Advisor` protocol + `MockAdvisor` (the sealed LLM/
+  decision node; a real-LLM `Advisor` implementation is the documented next
+  seam, same as every sibling cloud-itonami actor's advisor)
+- `pastaops.governor` — the Pasta Governor: ten independent hard checks +
+  escalation gates
+- `pastaops.operation` — `run-operation` (the original thin
+  proposal-through-governor driver) plus `build`, which compiles the
+  `langgraph-clj` `StateGraph`: advise → govern → decide → commit |
+  request-approval → commit | hold, with `interrupt-before` +
+  checkpoint-based resume for escalated operations
+- `pastaops.phase` — the batch LIFECYCLE state machine (`:intake ->
+  :design -> :produce -> :inspect -> :package -> :audit -> :archived`),
+  independent of the operation StateGraph above (it does not gate
+  auto-commit; it tracks where a batch physically is in production)
+- `pastaops.sim` — demo runner (`clojure -M:dev:run`)
+
 ## Testing
 
 ```bash
-# Run full test suite
-clojure -M:test
-
-# Check code quality
-clojure -M:lint
-
-# Run demo simulation
-clojure -M:run
+clojure -M:dev:test   # run the test suite (langgraph resolved via local sibling checkout)
+clojure -M:lint       # clj-kondo, 0 errors / 0 warnings
+clojure -M:dev:run    # demo runner -- drives the compiled StateGraph end-to-end
 ```
+
+`:dev` pins the transitive `langchain` dependency to the in-monorepo local
+checkout (`../../kotoba-lang/langchain`) for offline workspace development;
+a standalone fork should override `deps.edn`'s `:local/root` coordinates
+with git coordinates (see `deps.edn`'s own comment, and Standalone Use below).
 
 ## Standalone Use
 
 This repo is **forkable outside the workspace**. If cloning standalone (not in the kotoba-lang monorepo), override `:local/root` paths in `deps.edn`:
 
 ```clojure
-{:deps {io.github.kotoba-lang/langchain {:git/url "https://github.com/kotoba-lang/langchain" :git/tag "v0.1.0"}
-        io.github.kotoba-lang/langgraph {:git/url "https://github.com/kotoba-lang/langgraph" :git/tag "v0.1.0"}}}
+{:deps {io.github.kotoba-lang/langgraph {:git/url "https://github.com/kotoba-lang/langgraph" :git/tag "v0.1.0"}}
+ :aliases {:dev {:override-deps
+                 {io.github.kotoba-lang/langchain {:git/url "https://github.com/kotoba-lang/langchain" :git/tag "v0.1.0"}}}}}
 ```
 
 ## License
