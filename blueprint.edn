@@ -9,4 +9,44 @@
  :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :cae]
  :itonami.blueprint/optional-technologies [:optimization :telemetry]
  :itonami.blueprint/status :public-oss
- :itonami.blueprint/maturity :implemented}
+ :itonami.blueprint/maturity :implemented
+ :itonami.blueprint/implemented-slice
+ "PastaOpsAdvisor ⊣ Pasta Governor, langgraph-clj StateGraph
+ (langgraph.graph, pastaops.operation/build), append-only audit ledger
+ (pastaops.store/ledger + append-ledger!, MemStore). Fixes a prior
+ deferred-stub gap (same compounding class as other cloud-itonami-isic-*
+ siblings before their own fixes): `deps.edn` declared
+ `io.github.kotoba-lang/langgraph` ONLY under the unused `:dev` alias's
+ `:override-deps` with an EMPTY base `:deps` map (override-deps has
+ nothing to override when the lib was never in the graph, so
+ `langgraph.graph` was never actually resolvable on any real build/run/
+ test path); `pastaops.advisor` was a docstring-only namespace with no
+ protocol/implementation and was never `require`d by `pastaops.operation`
+ -- there was no real Advisor node in any flow; and
+ `pastaops.store/append-fact` (the ledger-append function) was called
+ ONLY from test setup, never from any real commit/hold path, because
+ there was no real commit/hold path (`run-operation` never touched a
+ store). Now: a genuinely compiled StateGraph (`:intake -> :advise ->
+ :govern -> :decide -+-> :commit / :request-approval -> :commit / :hold`)
+ with `interrupt-before #{:request-approval}` + in-memory checkpointer
+ for real human-in-the-loop resume, mirroring `bakeryops.operation`
+ (cloud-itonami-isic-1071) node/edge structure. Four closed-allowlist ops
+ (`:log-production-batch` / `:schedule-maintenance` /
+ `:flag-food-safety-concern` / `:coordinate-shipment`), all `:effect
+ :propose` only. `:log-production-batch` / `:coordinate-shipment`
+ (real actuation) and `:flag-food-safety-concern` (food-safety, never
+ auto-resolved by confidence) ALWAYS escalate to a human plant operator
+ via the compiled graph's `:request-approval` node (checkpoint-based
+ resume), proven end-to-end by `test/pastaops/operation_graph_test.cljc`
+ exercising commit / hard-hold (batch never staged, and a HARD
+ drying-temp violation that pre-empts what would otherwise be an
+ always-escalate op) / escalate-approve / escalate-reject / coordinate-
+ shipment-unregistered-hold through the REAL compiled graph, including a
+ falsifiable proof that a custom injected Advisor's own (randomly
+ generated, non-hardcoded) proposal `:summary` is what lands in the
+ committed ledger fact -- not a graph-internal literal. `pastaops.store`
+ now also exposes a `Store` protocol (`MemStore`) alongside its original
+ pure `{:batches ...}` value helpers (unchanged, still used directly by
+ `pastaops.governor`'s independent checks). 47 tests / 173 assertions
+ green (`clojure -M:dev:test`), clj-kondo 0 errors, demo runnable
+ end-to-end (`clojure -M:dev:run`)."}
