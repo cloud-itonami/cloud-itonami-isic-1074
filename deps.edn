@@ -18,7 +18,16 @@
  ;; as the run/test path (`:run`, `:test`, `:dev:test`). That is the
  ;; direct cause of `pastaops.operation` never having been able to
  ;; `:require [langgraph.graph]` in the first place.
- :deps {io.github.kotoba-lang/langgraph
+ ;;
+ ;; jp-go-digital-design-system (DADS) is the workspace-wide base design
+ ;; system; `jp-go-dds.skin/dds+skin` is what `pastaops.render-html`
+ ;; inlines into the generated operator console. Pinned by :git/sha (not
+ ;; :local/root) so the console still builds in a standalone fork --
+ ;; same coordinate as the already-rendered siblings.
+ :deps {io.github.kotoba-lang/jp-go-digital-design-system
+        {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
+         :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}
+        io.github.kotoba-lang/langgraph
         {:local/root "../../kotoba-lang/langgraph"}}
  :aliases
  {;; offline workspace dev -- pin transitive langchain to local checkout
@@ -27,6 +36,11 @@
          {:local/root "../../kotoba-lang/langchain"}}}
   ;; clojure -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "pastaops.sim"]}
+  ;; clojure -M:dev:render-html [out-file]
+  ;;   -> regenerate docs/samples/operator-console.html by running the
+  ;;      REAL compiled StateGraph (flagship checklist item 2). Refuses
+  ;;      to write the file if the run produced no HARD governor holds.
+  :render-html {:main-opts ["-m" "pastaops.render-html"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
