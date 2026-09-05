@@ -1,640 +1,899 @@
 (ns pastaops.render-html
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  Closes flagship checklist item 2 for this repo: there was NO demo page
-  and no generator here at all. Every row on the produced page is the
-  output of a REAL run of this repo's own actor stack --
-  `pastaops.operation/build` (a genuinely compiled `langgraph.graph`
-  StateGraph) -> `pastaops.advisor` -> `pastaops.governor` ->
-  `pastaops.store` -- driven through `langgraph.graph/run*` exactly the
-  way `pastaops.sim` and `test/pastaops/operation_graph_test.cljc` drive
-  it, including real `interrupt-before` checkpoint/resume for the
-  human-in-the-loop approval gate. Nothing on the page is hand-typed
-  HTML describing behaviour: the batch table is `store/snapshot`, the
-  ledger table is `store/ledger`, the hold tables are the Governor's own
-  `:violations` maps, and even the action-gate table is derived at render
-  time from `pastaops.governor/allowed-ops` / `high-stakes` /
-  `always-escalate-ops` / `confidence-floor` rather than being a static
-  description that can silently drift from the code.
+  Closes flagship checklist item 2 for cloud-itonami-isic-1074: this repo
+  previously had NO demo page and no generator at all.
 
-  SEED DATA. This repo's `pastaops.store/mem-store` starts empty (unlike
-  siblings that ship a `seed-db`); batches are staged by the caller, as
-  `pastaops.sim` does. So the scenario seed lives here, and it is
-  DERIVED, not invented: `batch-001` is `pastaops.sim`'s own
-  `clean-batch` fixture verbatim, every other batch is built by
-  `clean-batch-for` out of `pastaops.facts/product-types` and
-  `pastaops.facts/jurisdictions` (drying window mid-points, the
-  jurisdiction's own `:required-evidence` list), and each deliberately
-  bad batch is that clean record perturbed by a value computed off the
-  same product record (e.g. `min - 5` degrees). The whole seed is
-  rendered on the page, so every id shown is traceable to it.
+  This namespace drives the REAL actor stack -- `pastaops.operation/build`'s
+  compiled langgraph StateGraph (`:intake -> :advise -> :govern -> :decide
+  -> {:commit | :request-approval | :hold}`) over a `pastaops.store/MemStore`,
+  censored by the independent `pastaops.governor`. It is driven exactly the
+  way this repo's own `pastaops.sim` demo driver drives it (`g/run*` with a
+  `:thread-id`, then a `:resume? true` run carrying the approval), confirmed
+  working BEFORE this file was written by running `clojure -M:dev:run`.
 
-  BUILD-TIME INVARIANT. `-main` REFUSES to write the file unless the run
-  actually produced HARD Governor holds, and unless every scenario
-  reached the disposition it declares. A console that shows only happy
-  paths -- or one where the Governor silently stopped refusing -- is not
-  a demo of a governed actor, so it is a build failure, not a note in a
-  README.
+  NOTHING on the rendered page is hand-typed domain content. Every batch id,
+  measured value, product/jurisdiction name, verdict, violation rule, hold
+  reason and ledger fact is read back out of this run's actual governor
+  verdicts and `store/ledger` output. The product windows (drying temperature
+  / time / moisture) and jurisdiction evidence requirements shown next to each
+  measurement are read from `pastaops.facts`, so the page shows the same
+  numbers the Governor itself compared against.
 
-  DETERMINISM. No timestamps, no randomness, no map-iteration order in
-  the output (every collection is explicitly sorted or already an
-  ordered vector). Two runs against the same seed produce byte-identical
-  files.
+  Two things this repo does NOT have, stated on the page rather than
+  papered over:
+    - `pastaops.store` has no `demo-data`/seed function of its own (unlike
+      several sibling actors). The seed below is therefore defined HERE and
+      staged through the real `store/register-batch!` seam; it is the input
+      to the run, not an output of it, and the page says so.
+    - `pastaops.phase` is not referenced by any other namespace in `src/`,
+      so there is no phase-based rollout gate to report. The page reports
+      the escalation gate that DOES exist (`governor/always-escalate-ops`),
+      read live off the governor namespace, and keeps it in a table separate
+      from the Governor's HARD refusals -- \"the Governor refused\" and \"a
+      human was asked\" are different events here.
+
+  Determinism: the page contains no timestamps and no wall-clock-derived
+  values, so two runs from the same seed are byte-identical. The Governor's
+  only clock-dependent check (`scale-calibration-overdue?`, via
+  `governor/now-epoch-ms`) is exercised by exactly one batch whose seeded
+  calibration date is fixed at 2019-01-01 -- unambiguously overdue no matter
+  when the page is generated -- and the page prints that fixed date, never a
+  derived \"days ago\".
 
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.string :as str]
-            [jp-go-dds.skin]
             [langgraph.graph :as g]
-            [pastaops.advisor :as advisor]
             [pastaops.facts :as facts]
             [pastaops.governor :as governor]
             [pastaops.operation :as operation]
             [pastaops.store :as store]))
 
-;; ----------------------------- seed -----------------------------
+;; ============================ scenario input ============================
 
-(def ^:private plant-op
-  {:actor-id "plant-op-01" :role :plant-operator})
+(def ^:private coordinator
+  "The actor context every request runs under. Deliberately NOT equal to any
+  approver id below: the ledger's commit fact carries `:actor (:actor-id
+  context)`, so if the coordinator and the approver shared a name, a search
+  for the approver's name in the ledger would find the coordinator's and
+  wrongly conclude the store had preserved the approver."
+  {:actor-id "pastaops-coordinator" :role :plant-operations-coordinator})
 
-(def ^:private clean-batch
-  "Verbatim copy of `pastaops.sim`'s own `clean-batch` fixture (which is
-  itself mirrored by `test/pastaops/operation_test.cljc` and
-  `operation_graph_test.cljc`): clean against every independent Governor
-  check."
-  {:product-type :macaroni/elbow
-   :jurisdiction :jp/prefectural
-   :drying-temp-c 85
-   :drying-time-minutes 250
-   :moisture-percent 12.0
-   :ingredients [:semolina/durum]
-   :declared-allergens #{:wheat}
-   :sanitation-score 85
-   :evidence-checklist [:formulation-record :extrusion-log :drying-log
-                        :moisture-test :allergen-declaration :weight-check]})
+(def ^:private line-operator "plant-op-01")
+(def ^:private quality-lead "qa-lead-02")
 
-(defn- clean-batch-for
-  "Build a Governor-clean batch record for `product-id` under
-  `jurisdiction`, with every drying parameter DERIVED from
-  `pastaops.facts/product-types` (window mid-points) and the evidence
-  checklist derived from the jurisdiction's own `:required-evidence`.
-  Nothing here is a magic number typed to match a check."
-  [product-id jurisdiction ingredients declared]
-  (let [p (facts/product-type-by-id product-id)
-        j (facts/jurisdiction-by-id jurisdiction)]
-    {:product-type product-id
-     :jurisdiction jurisdiction
-     :drying-temp-c (quot (+ (:drying-temp-c-min p) (:drying-temp-c-max p)) 2)
-     :drying-time-minutes (quot (+ (:drying-time-min-minutes p)
-                                   (:drying-time-max-minutes p)) 2)
-     :moisture-percent (:moisture-target-percent p)
-     :ingredients ingredients
-     :declared-allergens declared
-     :sanitation-score 85
-     :evidence-checklist (vec (:required-evidence j))}))
+(def ^:private calibration-2019
+  "Fixed epoch-ms for 2019-01-01T00:00:00Z. The one seeded scale-calibration
+  date in this scenario. `registry/scale-calibration-overdue?` compares it
+  against the host clock (180-day window); a date this old is overdue on any
+  date this page could be generated, which is what keeps the run
+  deterministic while still exercising the check for real."
+  1546300800000)
 
-(defn- product-of [batch] (facts/product-type-by-id (:product-type batch)))
-
-(def ^:private stale-calibration-epoch-ms
-  "2020-01-01T00:00:00Z. Fixed (not `now - N`) so the page stays
-  byte-identical across runs; far enough past that
-  `registry/scale-calibration-overdue?` is stable regardless of when the
-  build runs."
-  1577836800000)
+(def ^:private full-evidence
+  "The complete evidence checklist. Every jurisdiction in `pastaops.facts`
+  requires exactly these six items, so one vector satisfies all three."
+  [:formulation-record :extrusion-log :drying-log
+   :moisture-test :allergen-declaration :weight-check])
 
 (def ^:private seed-batches
-  "The staged plant records this console is rendered from. Each entry is
-  a clean record (derived above) or that same record perturbed by ONE
-  value computed off its own product window, so exactly one Governor
-  rule fires per bad batch."
-  (let [b002 (clean-batch-for :pasta/spaghetti :us/fda [:semolina/durum] #{:wheat})
-        b003 (clean-batch-for :noodle/egg :eu/efsa [:semolina/durum :egg/whole] #{:wheat :eggs})
-        b004 (clean-batch-for :couscous/semolina :jp/prefectural [:semolina/durum] #{:wheat})
-        b005 (clean-batch-for :pasta/spaghetti :us/fda [:semolina/durum] #{:wheat})
-        b006 (clean-batch-for :macaroni/elbow :jp/prefectural [:semolina/durum] #{:wheat})
-        b007 (clean-batch-for :noodle/egg :eu/efsa [:semolina/durum :egg/whole] #{:wheat})
-        b008 (clean-batch-for :pasta/spaghetti :us/fda [:semolina/durum] #{:wheat})
-        b009 (clean-batch-for :couscous/semolina :jp/prefectural [:semolina/durum] #{:wheat})
-        b010 (clean-batch-for :macaroni/elbow :jp/prefectural [:semolina/durum] #{:wheat})
-        b011 (clean-batch-for :pasta/spaghetti :jp/prefectural [:semolina/durum] #{:wheat})
-        b012 (clean-batch-for :noodle/egg :us/fda [:semolina/durum :egg/whole] #{:wheat :eggs})]
-    ;; ordered so the rendered seed table is deterministic
-    [["batch-001" clean-batch
-      "clean (pastaops.sim fixture) — logging + maintenance + safety-flag lane"]
-     ["batch-002" b002
-      "clean — finished-product shipment lane"]
-     ["batch-003" (assoc b003 :drying-temp-c (- (:drying-temp-c-min (product-of b003)) 5))
-      "drying temperature 5 ℃ below the product's own safe window"]
-     ["batch-004" (assoc b004 :drying-time-minutes (+ (:drying-time-max-minutes (product-of b004)) 30))
-      "drying time 30 min past the product's own maximum"]
-     ["batch-005" (assoc b005 :moisture-percent (+ (:moisture-target-percent (product-of b005))
-                                                   (:moisture-tolerance-percent (product-of b005))
-                                                   1.0))
-      "post-drying moisture 1.0 pt above target+tolerance (mold-growth hazard)"]
-     ["batch-006" (assoc b006 :sanitation-score 60)
-      "plant sanitation score below the Governor's minimum (75)"]
-     ["batch-007" b007
-      "egg-noodle formulation (:egg/whole) with :eggs left undeclared"]
-     ["batch-008" (assoc b008 :evidence-checklist (vec (rest (:evidence-checklist b008))))
-      "jurisdiction evidence checklist missing its first required item"]
-     ["batch-009" (assoc b009 :safety-concern-raised? true)
-      "open, unresolved food-safety flag"]
-     ["batch-010" b010
-      "clean — used to show a proposal that cites no jurisdiction"]
-     ["batch-011" (assoc b011 :scale-last-calibration-date stale-calibration-epoch-ms)
-      "dosing-scale calibration far past its 180-day limit"]
-     ["batch-012" (assoc b012 :weight-variance-grams 120)
-      "packaged weight variance 120 g, past the 50 g tolerance"]]))
+  "Staged (pre-commit) production batches, in the shape
+  `store/register-batch!`/`store/stage-batch` expects. Each defective batch
+  carries EXACTLY ONE defect so that the Governor's verdict isolates a single
+  rule -- the drying/moisture windows each value is measured against live in
+  `pastaops.facts/product-types`, and the evidence requirements in
+  `pastaops.facts/jurisdictions`."
+  [["batch-101" "clean macaroni run -- full log + shipment lifecycle"
+    {:product-type :macaroni/elbow :jurisdiction :jp/prefectural
+     :drying-temp-c 85 :drying-time-minutes 250 :moisture-percent 12.0
+     :sanitation-score 88 :weight-variance-grams 18
+     :ingredients [:semolina/durum :water/filtered :salt/sea]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-;; ----------------------------- scenarios -----------------------------
+   ["batch-102" "clean spaghetti run -- operator declines the log"
+    {:product-type :pasta/spaghetti :jurisdiction :us/fda
+     :drying-temp-c 90 :drying-time-minutes 240 :moisture-percent 11.8
+     :sanitation-score 92 :weight-variance-grams 12
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-(def ^:private rogue-advisor
-  "A deliberately mis-behaving Advisor injected through `operation/build`'s
-  own `:advisor` seam: it claims direct write authority (`:effect :write`)
-  instead of proposing. Nothing about the graph changes -- the Governor's
-  `:effect-not-propose` invariant is what refuses it, which is the point."
-  (reify advisor/Advisor
-    (-advise [_ _store request]
-      {:op (:op request)
-       :effect :write
-       :value {:equipment "extruder-2"}
-       :cites [{:spec "Equipment-Manual"}]
-       :summary "Maintenance window claimed with direct write authority"
-       :confidence 0.95})))
+   ["batch-103" "drying temperature above the product's safe window"
+    {:product-type :macaroni/elbow :jurisdiction :jp/prefectural
+     :drying-temp-c 95 :drying-time-minutes 250 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-(def ^:private scenarios
-  "Every scenario this console runs, in order. `:expect` is asserted
-  against the REAL disposition the graph reaches (see `check-run!`), so a
-  Governor that stops refusing fails the build instead of quietly
-  producing a greener page."
-  [{:id "t01" :request {:op :schedule-maintenance :subject "batch-001"
-                        :equipment "extruder-2" :note "quarterly deep-clean"}
-    :note "clean, low-stakes — the only route that commits with no human"
-    :expect :commit}
+   ["batch-104" "drying time past the product's maximum"
+    {:product-type :pasta/spaghetti :jurisdiction :us/fda
+     :drying-temp-c 90 :drying-time-minutes 312 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-   {:id "t02" :request {:op :log-production-batch :subject "batch-001"
-                        :jurisdiction :jp/prefectural}
-    :approval {:status :approved :by "plant-op-01"}
-    :note "always escalates (real actuation) — operator approves"
-    :expect :commit}
+   ["batch-105" "post-drying moisture above tolerance (mould-growth hazard)"
+    {:product-type :couscous/semolina :jurisdiction :eu/efsa
+     :drying-temp-c 55 :drying-time-minutes 95 :moisture-percent 11.4
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-   {:id "t03" :request {:op :log-production-batch :subject "batch-001"
-                        :jurisdiction :jp/prefectural}
-    :note "same batch a second time — HARD block wins over the escalation"
-    :expect :hold}
+   ["batch-106" "plant sanitation score below the required minimum"
+    {:product-type :noodle/egg :jurisdiction :jp/prefectural
+     :drying-temp-c 56 :drying-time-minutes 330 :moisture-percent 11.0
+     :sanitation-score 62 :weight-variance-grams 20
+     :ingredients [:semolina/durum :egg/whole :water/filtered]
+     :declared-allergens #{:wheat :eggs}
+     :evidence-checklist full-evidence}]
 
-   {:id "t04" :request {:op :coordinate-shipment :subject "batch-002"
-                        :jurisdiction :us/fda}
-    :approval {:status :approved :by "plant-op-01"}
-    :note "always escalates (real actuation) — operator approves"
-    :expect :commit}
+   ["batch-107" "dosing-scale calibration lapsed"
+    {:product-type :macaroni/elbow :jurisdiction :us/fda
+     :drying-temp-c 85 :drying-time-minutes 250 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 20
+     :scale-last-calibration-date calibration-2019
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-   {:id "t05" :request {:op :coordinate-shipment :subject "batch-002"
-                        :jurisdiction :us/fda}
-    :note "shipment already finalized once"
-    :expect :hold}
+   ["batch-108" "finished-weight variance beyond tolerance"
+    {:product-type :pasta/spaghetti :jurisdiction :eu/efsa
+     :drying-temp-c 90 :drying-time-minutes 220 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 86
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-   {:id "t06" :request {:op :flag-food-safety-concern :subject "batch-001"
-                        :jurisdiction :jp/prefectural
-                        :concern "possible wheat/egg allergen cross-contact, line 2"}
-    :approval {:status :rejected :by "plant-op-01"}
-    :note "always escalates (food safety is never auto-resolved) — operator rejects"
-    :expect :hold}
+   ["batch-109" "egg in the formulation, not on the allergen declaration"
+    {:product-type :noodle/egg :jurisdiction :eu/efsa
+     :drying-temp-c 56 :drying-time-minutes 330 :moisture-percent 11.0
+     :sanitation-score 90 :weight-variance-grams 20
+     :ingredients [:semolina/durum :egg/whole]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]
 
-   {:id "t07" :request {:op :log-production-batch :subject "batch-003" :jurisdiction :eu/efsa}
-    :note "drying temperature outside the product's safe window"
-    :expect :hold}
+   ["batch-110" "open, unresolved food-safety concern"
+    {:product-type :couscous/semolina :jurisdiction :jp/prefectural
+     :drying-temp-c 52 :drying-time-minutes 100 :moisture-percent 10.0
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :safety-concern-raised? true :safety-concern-resolved? false
+     :evidence-checklist full-evidence}]
 
-   {:id "t08" :request {:op :log-production-batch :subject "batch-004" :jurisdiction :jp/prefectural}
-    :note "drying time past the product's maximum"
-    :expect :hold}
+   ["batch-111" "moisture test missing from the evidence checklist"
+    {:product-type :macaroni/elbow :jurisdiction :jp/prefectural
+     :drying-temp-c 85 :drying-time-minutes 250 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist [:formulation-record :extrusion-log :drying-log
+                          :allergen-declaration :weight-check]}]
 
-   {:id "t09" :request {:op :log-production-batch :subject "batch-005" :jurisdiction :us/fda}
-    :note "post-drying moisture out of the food-safety window"
-    :expect :hold}
+   ["batch-112" "clean, but the request cites no jurisdiction"
+    {:product-type :pasta/spaghetti :jurisdiction :jp/prefectural
+     :drying-temp-c 90 :drying-time-minutes 240 :moisture-percent 12.0
+     :sanitation-score 90 :weight-variance-grams 15
+     :ingredients [:semolina/durum :water/filtered]
+     :declared-allergens #{:wheat}
+     :evidence-checklist full-evidence}]])
 
-   {:id "t10" :request {:op :log-production-batch :subject "batch-006" :jurisdiction :jp/prefectural}
-    :note "plant sanitation score below minimum"
-    :expect :hold}
+(def ^:private unregistered-batch
+  "Deliberately never staged, to exercise the Governor's
+  `:batch-not-registered` refusal against a real absent store record."
+  "batch-113")
 
-   {:id "t11" :request {:op :log-production-batch :subject "batch-007" :jurisdiction :eu/efsa}
-    :note "allergen declaration under-declares the formulation"
-    :expect :hold}
+;; ============================ driving the actor ============================
 
-   {:id "t12" :request {:op :log-production-batch :subject "batch-008" :jurisdiction :us/fda}
-    :note "jurisdiction evidence checklist incomplete"
-    :expect :hold}
-
-   {:id "t13" :request {:op :log-production-batch :subject "batch-009" :jurisdiction :jp/prefectural}
-    :note "open food-safety flag never resolved"
-    :expect :hold}
-
-   {:id "t14" :request {:op :log-production-batch :subject "batch-010"}
-    :note "request carries no jurisdiction — the proposal cites none"
-    :expect :hold}
-
-   {:id "t15" :request {:op :log-production-batch :subject "batch-011" :jurisdiction :jp/prefectural}
-    :note "dosing-scale calibration overdue"
-    :expect :hold}
-
-   {:id "t16" :request {:op :log-production-batch :subject "batch-012" :jurisdiction :us/fda}
-    :note "packaged weight variance excessive"
-    :expect :hold}
-
-   {:id "t17" :request {:op :log-production-batch :subject "batch-999" :jurisdiction :jp/prefectural}
-    :note "batch never staged at this plant"
-    :expect :hold}
-
-   {:id "t18" :request {:op :coordinate-shipment :subject "ghost-batch" :jurisdiction :jp/prefectural}
-    :note "shipment for a batch this plant never checked in"
-    :expect :hold}
-
-   {:id "t19" :request {:op :operate-extruder :subject "batch-001"}
-    :note "outside the closed allowlist — this actor never operates the line"
-    :expect :hold}
-
-   {:id "t20" :request {:op :schedule-maintenance :subject "batch-001"
-                        :equipment "extruder-2"}
-    :actor :rogue
-    :note "injected Advisor claims :effect :write — the Governor refuses it"
-    :expect :hold}])
-
-(defn- run-scenario!
-  "Drive ONE scenario through the real compiled graph and capture exactly
-  the ledger facts THIS scenario appended (by index delta -- never by
-  joining on [op subject], which is not unique here: batch-001 is the
-  subject of five different runs and batch-002 of two)."
-  [st actor {:keys [id request approval note expect]}]
+(defn- exec!
+  "One graph run. Snapshots the ledger before/after so every fact this run
+  appended is associated with THIS run by construction -- never by joining on
+  `[op subject]`, which is not unique here (batch-101 is the subject of two
+  separate `:log-production-batch` runs with opposite outcomes)."
+  [st actor tid label request]
   (let [before (count (store/ledger st))
-        r1 (g/run* actor {:request request :context plant-op} {:thread-id id})
-        r2 (when (and approval (= :interrupted (:status r1)))
-             (g/run* actor {:approval approval} {:thread-id id :resume? true}))
-        final (or r2 r1)
-        facts (subvec (vec (store/ledger st)) before)]
-    {:id id
-     :request request
-     :note note
-     :expect expect
-     :approval approval
-     :interrupted? (= :interrupted (:status r1))
-     :frontier (:frontier r1)
-     :status (:status final)
-     :disposition (:disposition (:state final))
-     :verdict (:verdict (:state final))
-     :audit (vec (:audit (:state final)))
-     :facts facts}))
+        result (g/run* actor {:request request :context coordinator}
+                       {:thread-id tid})]
+    {:tid tid :label label :request request :result result
+     :ledger-from before}))
+
+(defn- resume!
+  "Resume an interrupted thread with a human decision, and fold the resumed
+  run's result (and any ledger facts it appended) back into the run record."
+  [st actor run status by]
+  (let [result (g/run* actor {:approval {:status status :by by}}
+                       {:thread-id (:tid run) :resume? true})]
+    (assoc run
+           :result result
+           :approval {:status status :by by})))
+
+(defn- finish
+  "Attach the ledger slice this run produced. Called once the run (including
+  any resume) is complete and no further facts can be appended for it."
+  [st run]
+  (assoc run :ledger-facts (vec (subvec (vec (store/ledger st))
+                                        (:ledger-from run)))))
 
 (defn run-demo!
-  "Stage the seed, build the real actor, run every scenario. Returns
-  `{:store .. :runs [..]}`; every value the page renders comes from here."
+  "Drive a fresh `MemStore`, seeded with `seed-batches`, through every
+  disposition this actor can reach:
+
+    - one low-stakes auto-commit that never touches a human
+      (`:schedule-maintenance` on batch-101);
+    - three human-approved commits (batch-101 logged then shipped, and
+      batch-110's food-safety concern), each approved by a named human;
+    - one human REFUSAL (batch-102's log declined by the line operator) --
+      an `:approval-rejected` hold, which is a different event from a
+      Governor refusal and is reported separately;
+    - fourteen HARD Governor holds, each isolating a distinct rule, none of
+      which ever reaches a human.
+
+  Returns `{:store .. :runs ..}`; every value the page shows is read back out
+  of these."
   []
   (let [st (store/mem-store)]
-    (doseq [[id batch _why] seed-batches]
+    (doseq [[id _why batch] seed-batches]
       (store/register-batch! st id batch))
-    (let [default-actor (operation/build st)
-          rogue-actor (operation/build st {:advisor rogue-advisor})]
-      {:store st
-       :runs (mapv (fn [sc]
-                     (run-scenario! st
-                                    (if (= :rogue (:actor sc)) rogue-actor default-actor)
-                                    sc))
-                   scenarios)})))
+    (let [actor (operation/build st)
+          runs (atom [])
+          add! (fn [r] (swap! runs conj (finish st r)) r)
+          plain (fn [tid label request]
+                  (add! (exec! st actor tid label request)))
+          gated (fn [tid label request status by]
+                  (let [r (exec! st actor tid label request)]
+                    (add! (resume! st actor r status by))))]
 
-;; --------------------- classification (measured, not assumed) ---------------------
+      ;; ---- batch-101: low-stakes auto-commit, then the full gated lifecycle
+      (plain "t01" "routine maintenance on the extruder (low stakes)"
+             {:op :schedule-maintenance :subject "batch-101"
+              :equipment "extruder-2" :note "quarterly deep-clean"})
 
-(defn- approver-rejection?
-  "A hold produced by a HUMAN rejecting an escalated proposal. The graph
-  writes it through `governor/hold-fact` too, so it carries a
-  `:violations` vector and would satisfy a naive `count` of holds -- it
-  is NOT a Governor refusal and is reported separately."
-  [f]
-  (or (= :approval-rejected (:t f))
-      (some #(= :approver-rejected (:rule %)) (:violations f))))
+      (gated "t02" "log the finished batch into production records"
+             {:op :log-production-batch :subject "batch-101"
+              :jurisdiction :jp/prefectural}
+             :approved line-operator)
 
-(defn- hard-governor-hold?
-  "A hold the GOVERNOR itself refused: a `:governor-hold` fact carrying at
-  least one real rule violation that is not the human-rejection marker.
-  (An empty-`:violations` hold would fail this test on purpose.)"
-  [f]
-  (and (= :governor-hold (:t f))
-       (seq (:violations f))
-       (not (approver-rejection? f))))
+      (gated "t03" "coordinate shipment of the finished batch"
+             {:op :coordinate-shipment :subject "batch-101"
+              :jurisdiction :jp/prefectural}
+             :approved quality-lead)
 
-(def ^:private approver-keys
-  "Every key this fleet has been seen to carry an approver under. Scanned
-  for at RENDER TIME (see `approver-on-record`) so the page self-corrects
-  if the store starts retaining the approver."
-  #{:approved-by :approver :by :signed-off-by :approved_by})
+      (plain "t04" "log batch-101 a second time"
+             {:op :log-production-batch :subject "batch-101"
+              :jurisdiction :jp/prefectural})
 
-(defn- approver-on-record
-  "Deep-scan a durable ledger fact for any approver key. Returns
-  `[key value]` or nil. This is the MEASUREMENT behind the disclosure
-  section -- nothing about approver retention is assumed."
-  [fact]
-  (letfn [(scan [x]
-            (when (map? x)
-              (or (first (for [[k v] x
-                               :when (and (contains? approver-keys k) (some? v))]
-                           [k v]))
-                  (first (keep scan (vals x))))))]
-    (scan fact)))
+      (plain "t05" "ship batch-101 a second time"
+             {:op :coordinate-shipment :subject "batch-101"
+              :jurisdiction :jp/prefectural})
 
-(defn- approver-from-run
-  "The approver as the RUN observed it (the `:approval-granted` audit
-  entry the `:request-approval` node emitted). Keyed off this scenario's
-  own thread, so it can never be inherited from an earlier run."
+      ;; ---- batch-102: the human says no
+      (gated "t06" "log the finished batch into production records"
+             {:op :log-production-batch :subject "batch-102"
+              :jurisdiction :us/fda}
+             :rejected line-operator)
+
+      ;; ---- one HARD hold per independent Governor check
+      (plain "t07" "log a batch dried above its safe temperature"
+             {:op :log-production-batch :subject "batch-103"
+              :jurisdiction :jp/prefectural})
+      (plain "t08" "log a batch dried past its time limit"
+             {:op :log-production-batch :subject "batch-104"
+              :jurisdiction :us/fda})
+      (plain "t09" "log a batch left too moist to be shelf-stable"
+             {:op :log-production-batch :subject "batch-105"
+              :jurisdiction :eu/efsa})
+      (plain "t10" "log a batch made on an unhygienic line"
+             {:op :log-production-batch :subject "batch-106"
+              :jurisdiction :jp/prefectural})
+      (plain "t11" "log a batch dosed on an uncalibrated scale"
+             {:op :log-production-batch :subject "batch-107"
+              :jurisdiction :us/fda})
+      (plain "t12" "log a batch whose pack weights drifted"
+             {:op :log-production-batch :subject "batch-108"
+              :jurisdiction :eu/efsa})
+      (plain "t13" "log a batch with an under-declared allergen"
+             {:op :log-production-batch :subject "batch-109"
+              :jurisdiction :eu/efsa})
+      (plain "t14" "log a batch with an open food-safety concern"
+             {:op :log-production-batch :subject "batch-110"
+              :jurisdiction :jp/prefectural})
+
+      ;; ---- the concern itself: always escalates, human approves
+      (gated "t15" "raise the food-safety concern for human review"
+             {:op :flag-food-safety-concern :subject "batch-110"
+              :jurisdiction :jp/prefectural
+              :concern "possible wheat/egg allergen cross-contact, line 2"}
+             :approved quality-lead)
+
+      (plain "t16" "log a batch with an incomplete evidence pack"
+             {:op :log-production-batch :subject "batch-111"
+              :jurisdiction :jp/prefectural})
+      (plain "t17" "log a batch without citing any jurisdiction"
+             {:op :log-production-batch :subject "batch-112"})
+      (plain "t18" "ship a batch this plant never checked in"
+             {:op :coordinate-shipment :subject unregistered-batch
+              :jurisdiction :jp/prefectural})
+      (plain "t19" "drive the extruder directly"
+             {:op :operate-extruder :subject "batch-101"
+              :jurisdiction :jp/prefectural})
+
+      {:store st :runs @runs})))
+
+;; ============================ reading the run back ============================
+
+(defn- state-of [run] (get-in run [:result :state]))
+(defn- verdict-of [run] (:verdict (state-of run)))
+(defn- audit-of [run] (vec (:audit (state-of run))))
+
+(defn- hard-hold?
+  "A HARD hold is a Governor refusal: `:hard?` on the verdict AND a
+  `:governor-hold` fact actually written. A human refusal
+  (`:approval-rejected`) also lands as `:disposition :hold` but is NOT a
+  Governor refusal and must not be counted as one."
   [run]
-  (some (fn [a] (when (= :approval-granted (:t a)) (:by a))) (:audit run)))
+  (and (true? (:hard? (verdict-of run)))
+       (boolean (some #(= :governor-hold (:t %)) (audit-of run)))))
 
-;; ----------------------------- html -----------------------------
+(defn- hold-violations [run] (vec (:violations (verdict-of run))))
+
+(defn- hard-rules
+  "The distinct rule keywords a HARD hold cited, in order."
+  [run]
+  (mapv :rule (hold-violations run)))
+
+(defn- substantive-hard-hold?
+  "A HARD hold that actually says WHY. A hold whose `:violations` is empty
+  carries no reason a reader could act on, so it does not satisfy the
+  build-time invariant below on its own."
+  [run]
+  (and (hard-hold? run)
+       (boolean (seq (remove nil? (hard-rules run))))
+       (boolean (some (fn [v] (seq (str (:detail v)))) (hold-violations run)))))
+
+(defn- human-rejection?
+  "A human looked at the proposal and declined it -- not a Governor refusal."
+  [run]
+  (boolean (some #(= :approval-rejected (:t %)) (audit-of run))))
+
+(defn- committed? [run]
+  (boolean (some #(= :committed (:t %)) (audit-of run))))
+
+(defn- escalated? [run]
+  (boolean (some #(= :approval-requested (:t %)) (audit-of run))))
+
+(defn- outcome
+  "The single word this run ended on, derived from the run's own facts."
+  [run]
+  (cond
+    (hard-hold? run)      :governor-hold
+    (human-rejection? run) :human-refused
+    (and (committed? run) (escalated? run)) :approved-commit
+    (committed? run)      :auto-commit
+    :else                 :unknown))
+
+;; ---- approver attribution, MEASURED rather than assumed -------------------
+
+(defn- value-paths
+  "Every key path inside `form` whose leaf equals `v`, as dotted strings.
+  Used to locate an approver's name in the run output and in the ledger
+  WITHOUT assuming which key it should live under -- if the store is later
+  fixed to keep it, this finds it there and the page corrects itself."
+  [form v]
+  (letfn [(go [path x]
+            (cond
+              (= x v)        [path]
+              (map? x)       (mapcat (fn [[k vv]] (go (conj path k) vv)) x)
+              (set? x)       (mapcat #(go (conj path "#") %) x)
+              (sequential? x) (apply concat
+                                     (map-indexed (fn [i vv] (go (conj path i) vv)) x))
+              :else          nil))]
+    (->> (go [] form)
+         (map (fn [p] (str/join "." (map #(if (keyword? %) (name %) (str %)) p))))
+         sort
+         vec)))
+
+(defn- approval-attribution
+  "For one approved run, where the approver's name actually survives.
+  Everything here is measured off this run's real output; nothing about the
+  store's behaviour is assumed."
+  [run]
+  (let [by (get-in run [:approval :by])
+        st (state-of run)]
+    {:run run
+     :approver by
+     :in-record  (value-paths (:record st) by)
+     :in-audit   (value-paths (audit-of run) by)
+     :in-ledger  (value-paths (:ledger-facts run) by)}))
+
+(defn- attribution-summary
+  "Classify what the store did with the approver, from the measurements."
+  [attributions]
+  (let [ledger-keeps (filter #(seq (:in-ledger %)) attributions)
+        run-keeps    (filter #(or (seq (:in-record %)) (seq (:in-audit %)))
+                             attributions)]
+    (cond
+      (empty? attributions) :no-approval-path
+      (= (count ledger-keeps) (count attributions)) :ledger-keeps-approver
+      (seq ledger-keeps) :ledger-keeps-approver-partially
+      (seq run-keeps) :ledger-drops-approver
+      :else :approver-absent-everywhere)))
+
+;; ============================ HTML ============================
 
 (defn- esc [v]
   (-> (str v)
       (str/replace "&" "&amp;")
       (str/replace "<" "&lt;")
-      (str/replace ">" "&gt;")))
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
 
-(defn- kw [v] (if (keyword? v) (subs (str v) 1) (str v)))
+(defn- kw [v] (if (keyword? v) (name v) (str v)))
 
-(defn- code [v] (str "<code>" (esc (kw v)) "</code>"))
+(defn- code [v] (str "<code>" (esc v) "</code>"))
 
-(defn- row [& cells]
-  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+(defn- pill [cls label] (str "<span class=\"pill " cls "\">" (esc label) "</span>"))
 
-(defn- section [title lead headers rows]
+(defn- num
+  "Render a number without a trailing `.0` on integral doubles, so the page
+  reads the way the plant would write it and stays byte-stable."
+  [v]
+  (cond
+    (nil? v) "—"
+    (and (float? v) (== v (Math/rint (double v)))) (str (long v))
+    :else (str v)))
+
+(def ^:private dds-css
+  "Digital Agency Design System tokens (jp-go-digital-design-system, upstream
+  digital-go-jp/design-system-example-components-html @ 3b34f4c, MIT (c) 2025
+  デジタル庁). The token VALUES below are copied from the DADS stylesheet this
+  repo already vendors in `docs/index.html`, so the console and the product
+  face render from the same palette. Only the handful of tokens this page
+  actually uses is declared -- re-vendoring the full 69 KB sheet to style
+  three colours of table row would be padding, not design-system conformance."
+  (str/join
+   "\n"
+   [":root{"
+    "--color-primitive-blue-50:#e8f1fe;--color-primitive-blue-100:#d9e6ff;"
+    "--color-primitive-blue-900:#0017c1;--color-primitive-blue-1000:#00118f;"
+    "--color-primitive-red-800:#ec0000;--color-primitive-red-900:#ce0000;--color-primitive-red-1000:#a90000;"
+    "--color-primitive-green-600:#259d63;--color-primitive-green-800:#197a4b;--color-primitive-green-900:#115a36;"
+    "--color-primitive-orange-600:#fb5b01;--color-primitive-orange-800:#c74700;--color-primitive-orange-900:#ac3e00;"
+    "--color-primitive-yellow-50:#fbf5e0;--color-primitive-yellow-900:#927200;"
+    "--color-neutral-solid-gray-50:#f2f2f2;--color-neutral-solid-gray-100:#e6e6e6;"
+    "--color-neutral-solid-gray-200:#cccccc;--color-neutral-solid-gray-536:#767676;"
+    "--color-neutral-solid-gray-600:#666666;--color-neutral-solid-gray-700:#4d4d4d;"
+    "--color-neutral-solid-gray-800:#333333;--color-neutral-solid-gray-900:#1a1a1a;"
+    "--color-semantic-error-1:var(--color-primitive-red-800);"
+    "--color-semantic-success-2:var(--color-primitive-green-800);"
+    "--color-semantic-warning-yellow-2:var(--color-primitive-yellow-900);"
+    "--color-key-900:var(--color-primitive-blue-900);"
+    "--font-family-sans:\"Noto Sans JP\",-apple-system,BlinkMacSystemFont,sans-serif;"
+    "--font-family-mono:\"Noto Sans Mono\",ui-monospace,monospace;"
+    "--elevation-1:0 2px 8px 1px rgba(0,0,0,.1),0 1px 5px 0 rgba(0,0,0,.3);"
+    "}"
+    "*{box-sizing:border-box}"
+    "body{margin:0;font-family:var(--font-family-sans);color:var(--color-neutral-solid-gray-900);"
+    "background:var(--color-neutral-solid-gray-50);line-height:1.7;font-size:15px}"
+    "header.bar{background:var(--color-key-900);color:#fff;padding:20px 24px}"
+    "header.bar h1{margin:0 0 6px;font-size:19px;font-weight:700;letter-spacing:.01em}"
+    "header.bar .badge{display:inline-block;font-size:12px;background:rgba(255,255,255,.16);"
+    "border:1px solid rgba(255,255,255,.34);border-radius:4px;padding:2px 9px}"
+    "main{max-width:1180px;margin:0 auto;padding:24px 20px 56px}"
+    "section.card{background:#fff;border:1px solid var(--color-neutral-solid-gray-200);"
+    "border-radius:8px;box-shadow:var(--elevation-1);padding:20px 22px;margin:0 0 20px}"
+    "section.card>h2{margin:0 0 4px;font-size:16px;font-weight:700;"
+    "color:var(--color-primitive-blue-1000)}"
+    "p.muted{margin:0 0 14px;color:var(--color-neutral-solid-gray-700);font-size:13px}"
+    "p.muted:last-child{margin-bottom:0}"
+    "table{border-collapse:collapse;width:100%;font-size:13px}"
+    "caption{caption-side:top;text-align:left;font-weight:700;font-size:13px;"
+    "padding:10px 0 6px;color:var(--color-neutral-solid-gray-800)}"
+    "th,td{border-bottom:1px solid var(--color-neutral-solid-gray-100);"
+    "padding:7px 10px;text-align:left;vertical-align:top}"
+    "thead th{background:var(--color-neutral-solid-gray-50);"
+    "border-bottom:2px solid var(--color-neutral-solid-gray-200);white-space:nowrap;"
+    "color:var(--color-neutral-solid-gray-800);font-size:12px}"
+    "tbody tr:last-child td{border-bottom:none}"
+    "td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}"
+    "code{font-family:var(--font-family-mono);font-size:.88em;"
+    "background:var(--color-neutral-solid-gray-50);"
+    "border:1px solid var(--color-neutral-solid-gray-200);border-radius:4px;padding:0 4px}"
+    "span.pill{display:inline-block;border-radius:10px;padding:1px 9px;font-size:11.5px;"
+    "font-weight:700;white-space:nowrap;border:1px solid transparent}"
+    ".pill.ok{background:#eaf6ef;color:var(--color-primitive-green-900);"
+    "border-color:var(--color-primitive-green-600)}"
+    ".pill.bad{background:#fdeaea;color:var(--color-primitive-red-1000);"
+    "border-color:var(--color-primitive-red-800)}"
+    ".pill.warn{background:var(--color-primitive-yellow-50);"
+    "color:var(--color-primitive-orange-900);border-color:var(--color-primitive-orange-600)}"
+    ".pill.info{background:var(--color-primitive-blue-50);"
+    "color:var(--color-primitive-blue-1000);border-color:var(--color-primitive-blue-100)}"
+    ".pill.mute{background:var(--color-neutral-solid-gray-50);"
+    "color:var(--color-neutral-solid-gray-600);border-color:var(--color-neutral-solid-gray-200)}"
+    "td.bad{color:var(--color-primitive-red-1000);font-weight:700}"
+    ".gap{color:var(--color-primitive-orange-900);font-weight:700}"
+    "dl.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin:0;font-size:13px}"
+    "dl.kv dt{color:var(--color-neutral-solid-gray-600)}"
+    "dl.kv dd{margin:0;font-weight:700}"
+    "footer{max-width:1180px;margin:0 auto;padding:0 20px 40px;"
+    "color:var(--color-neutral-solid-gray-536);font-size:12px}"]))
+
+(defn- table [caption headers rows]
+  (str "    <table>\n"
+       (when caption (str "      <caption>" (esc caption) "</caption>\n"))
+       "      <thead><tr>"
+       (str/join (map #(str "<th>" (esc %) "</th>") headers))
+       "</tr></thead>\n      <tbody>\n"
+       (if (seq rows)
+         (str (str/join "\n" rows) "\n")
+         (str "        <tr><td colspan=\"" (count headers)
+              "\">no rows produced by this run</td></tr>\n"))
+       "      </tbody>\n    </table>\n"))
+
+(defn- section [title lede & body]
   (str "  <section class=\"card\">\n"
        "    <h2>" title "</h2>\n"
-       (when lead (str "    <p class=\"muted\">" lead "</p>\n"))
-       "    <table>\n"
-       "      <thead><tr>" (str/join (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
-       "      <tbody>\n"
-       (str/join "\n" rows) "\n"
-       "      </tbody>\n"
-       "    </table>\n"
+       (when lede (str "    <p class=\"muted\">" lede "</p>\n"))
+       (str/join body)
        "  </section>\n"))
 
-(defn- seed-rows [st]
-  (let [snap (store/snapshot st)]
-    (for [[id _seed why] seed-batches
-          :let [b (store/production-batch snap id)
-                p (product-of b)]]
-      (row (code id)
-           (str (esc (:name p)) " <span class=\"muted\">" (esc (kw (:product-type b))) "</span>")
-           (esc (kw (:jurisdiction b)))
-           (str "<span class=\"num\">" (esc (:drying-temp-c b)) "</span> ℃ / "
-                "<span class=\"num\">" (esc (:drying-time-minutes b)) "</span> min / "
-                "<span class=\"num\">" (esc (:moisture-percent b)) "</span> %")
-           (str "<span class=\"num\">" (esc (:sanitation-score b)) "</span>")
-           (str (esc (str/join ", " (sort (map kw (:declared-allergens b)))))
-                (let [actual (facts/formulation-allergen-set (:ingredients b))]
-                  (if (seq (remove (:declared-allergens b) actual))
-                    (str " <span class=\"critical\">(formulation has "
-                         (esc (str/join ", " (sort (map kw actual)))) ")</span>")
-                    "")))
-           (str (if (:processed? b) "<span class=\"ok\">logged</span>" "<span class=\"muted\">staged</span>")
-                (when (:shipment-finalized? b) " · <span class=\"ok\">shipped</span>")
-                (when (and (:safety-concern-raised? b) (not (:safety-concern-resolved? b)))
-                  " · <span class=\"critical\">safety flag open</span>"))
-           (esc why)))))
+;; ---- section: seeded batches vs the windows the Governor compared against
 
-(defn- route-cell [{:keys [interrupted? approval disposition]}]
-  (cond
-    (and interrupted? (= :approved (:status approval)))
-    "<span class=\"warn\">escalated</span> → <span class=\"ok\">operator approved</span>"
-    (and interrupted? (= :rejected (:status approval)))
-    "<span class=\"warn\">escalated</span> → <span class=\"critical\">operator rejected</span>"
-    interrupted? "<span class=\"warn\">escalated · awaiting operator</span>"
-    (= :commit disposition) "<span class=\"ok\">auto-commit (no human needed)</span>"
-    :else "<span class=\"critical\">HARD hold · never reached a human</span>"))
+(defn- window-cell [actual lo hi unit bad?]
+  (str "<td class=\"n" (when bad? " bad") "\">" (num actual) " " (esc unit)
+       "<br><span style=\"font-weight:400;color:var(--color-neutral-solid-gray-600)\">"
+       (num lo) "–" (num hi) "</span></td>"))
 
-(defn- outcome-cell [{:keys [disposition facts]}]
-  (let [rules (->> facts (mapcat :violations) (map :rule) (remove nil?) distinct sort)]
-    (str (if (= :commit disposition)
-           "<span class=\"ok\">committed</span>"
-           "<span class=\"critical\">held</span>")
-         (when (seq rules)
-           (str " · " (str/join ", " (map #(str "<code>" (esc (kw %)) "</code>") rules)))))))
+(defn- batch-row [st [id why _seed]]
+  (let [b (store/production-batch st id)
+        p (facts/product-type-by-id (:product-type b))
+        j (facts/jurisdiction-by-id (:jurisdiction b))
+        mt (:moisture-target-percent p)
+        tol (:moisture-tolerance-percent p)
+        formula (facts/formulation-allergen-set (:ingredients b))
+        undeclared (sort (remove (:declared-allergens b) formula))
+        ev-ok? (facts/required-evidence-satisfied? (:jurisdiction b)
+                                                   (:evidence-checklist b))
+        missing-ev (sort (remove (set (:evidence-checklist b))
+                                 (:required-evidence j)))]
+    (str "        <tr><td>" (code id)
+         "<br><span style=\"color:var(--color-neutral-solid-gray-600)\">" (esc why)
+         "</span></td>"
+         "<td>" (esc (:name p)) "<br>" (code (kw (:product-type b))) "</td>"
+         "<td>" (esc (:name j)) "</td>"
+         (window-cell (:drying-temp-c b) (:drying-temp-c-min p) (:drying-temp-c-max p)
+                      "℃" (not (facts/drying-temp-in-range? (:drying-temp-c b) p)))
+         (window-cell (:drying-time-minutes b) (:drying-time-min-minutes p)
+                      (:drying-time-max-minutes p) "min"
+                      (not (facts/drying-time-in-range? (:drying-time-minutes b) p)))
+         (window-cell (:moisture-percent b) (- mt tol) (+ mt tol) "%"
+                      (not (facts/moisture-in-range? (:moisture-percent b) p)))
+         "<td class=\"n" (when (< (:sanitation-score b) 75) " bad") "\">"
+         (num (:sanitation-score b)) "<br>"
+         "<span style=\"font-weight:400;color:var(--color-neutral-solid-gray-600)\">≥75</span></td>"
+         "<td class=\"n" (when (> (:weight-variance-grams b) 50) " bad") "\">"
+         (num (:weight-variance-grams b)) " g<br>"
+         "<span style=\"font-weight:400;color:var(--color-neutral-solid-gray-600)\">≤50</span></td>"
+         "<td>" (if (seq undeclared)
+                  (str (pill "bad" (str "undeclared: "
+                                        (str/join ", " (map kw undeclared)))))
+                  (pill "ok" (str/join ", " (map kw (sort (:declared-allergens b))))))
+         "</td>"
+         "<td>" (if ev-ok?
+                  (pill "ok" (str (count (:evidence-checklist b)) "/"
+                                  (count (:required-evidence j))))
+                  (pill "bad" (str "missing " (str/join ", " (map kw missing-ev)))))
+         "</td>"
+         "<td>" (if (:scale-last-calibration-date b)
+                  (pill "warn" (str (java.time.Instant/ofEpochMilli
+                                     (:scale-last-calibration-date b))))
+                  (pill "mute" "not recorded"))
+         "</td>"
+         "<td>" (if (:processed? b) (pill "ok" "logged") (pill "mute" "not logged")) " "
+         (if (:shipment-finalized? b) (pill "ok" "shipped") (pill "mute" "not shipped"))
+         (when (:safety-concern-raised? b)
+           (str " " (pill (if (:safety-concern-resolved? b) "ok" "bad")
+                          (if (:safety-concern-resolved? b)
+                            "concern resolved" "concern open"))))
+         "</td></tr>")))
 
-(defn- run-rows [runs]
-  (for [r runs]
-    (row (code (:id r))
-         (code (:op (:request r)))
-         (code (:subject (:request r)))
-         (route-cell r)
-         (outcome-cell r)
-         (esc (:note r)))))
+;; ---- section: what the Governor did, run by run
 
-(defn- hold-rows [runs]
-  (for [r runs
-        f (:facts r)
-        :when (hard-governor-hold? f)
-        v (:violations f)]
-    (row (code (:id r))
-         (code (:op f))
-         (code (:subject f))
-         (str "<code class=\"critical\">" (esc (kw (:rule v))) "</code>")
-         (esc (:detail v)))))
+(defn- outcome-pill [run]
+  (case (outcome run)
+    :governor-hold   (pill "bad" "HARD hold · Governor refused")
+    :human-refused   (pill "warn" "human refused")
+    :approved-commit (pill "ok" "human approved · committed")
+    :auto-commit     (pill "ok" "auto-committed")
+    (pill "mute" "unknown")))
 
-(defn- rejection-rows [runs]
-  (for [r runs
-        f (:facts r)
-        :when (approver-rejection? f)]
-    (row (code (:id r))
-         (code (:op f))
-         (code (:subject f))
-         (esc (or (:by (:approval r)) "—"))
-         (str "<span class=\"num\">" (esc (:confidence f)) "</span>")
-         "advisor confidence was above the floor and the Governor found no HARD violation — the human still said no")))
+(defn- run-row [run]
+  (let [{:keys [op subject]} (:request run)
+        v (verdict-of run)]
+    (str "        <tr><td>" (code (:tid run)) "</td>"
+         "<td>" (code (kw op)) "<br>"
+         "<span style=\"color:var(--color-neutral-solid-gray-600)\">"
+         (esc (:label run)) "</span></td>"
+         "<td>" (code subject) "</td>"
+         "<td class=\"n\">" (num (:confidence v)) "</td>"
+         "<td>" (if (escalated? run)
+                  (pill "info" "yes")
+                  (pill "mute" "no · never reached a human"))
+         "</td>"
+         "<td>" (outcome-pill run) "</td></tr>")))
 
-(defn- gate-rows
-  "Derived from the Governor's own vars at render time, so this table
-  cannot drift away from the code the way a hand-written one does."
-  []
-  (for [op (sort-by kw governor/allowed-ops)]
-    (row (code op)
-         (cond
-           (contains? governor/high-stakes op)
-           "<span class=\"warn\">ALWAYS human approval — real actuation, never auto</span>"
-           (contains? governor/always-escalate-ops op)
-           "<span class=\"warn\">ALWAYS human approval — food safety is never auto-resolved</span>"
-           :else
-           (str "<span class=\"ok\">auto-commit when the Governor is clean and confidence ≥ "
-                (esc governor/confidence-floor) "</span>")))))
+(defn- hold-row [run]
+  (let [vs (hold-violations run)]
+    (str "        <tr><td>" (code (:tid run)) "</td>"
+         "<td>" (code (kw (:op (:request run)))) "</td>"
+         "<td>" (code (:subject (:request run))) "</td>"
+         "<td>" (str/join "<br>" (map #(code (kw (:rule %))) vs)) "</td>"
+         "<td>" (str/join "<br>" (map #(esc (:detail %)) vs)) "</td></tr>")))
 
-(defn- ledger-rows [ledger]
-  (for [f ledger]
-    (row (code (:t f))
-         (code (:op f))
-         (code (:subject f))
-         (esc (:actor f))
-         (code (:disposition f))
-         (esc (str/join ", " (map #(if (map? %) (str/join "/" (vals %)) (kw %)) (:basis f)))))))
+;; ---- section: escalation gate (distinct from Governor refusal)
 
-(defn- attribution-rows [runs]
-  (for [r runs
-        :let [who (approver-from-run r)]
-        :when who
-        f (:facts r)
-        :let [on-record (approver-on-record f)]]
-    (row (code (:id r))
-         (code (:t f))
-         (code (:subject f))
-         (esc who)
-         (if on-record
-           (str "<span class=\"ok\">retained as <code>" (esc (kw (first on-record)))
-                "</code> = " (esc (second on-record)) "</span>")
-           "<span class=\"warn\">not retained on the committed record — audit only</span>"))))
+(defn- gate-row [op]
+  (let [high? (contains? governor/high-stakes op)
+        allowed? (contains? governor/allowed-ops op)]
+    (str "        <tr><td>" (code (kw op)) "</td>"
+         "<td>" (if allowed? (pill "ok" "in the allowlist") (pill "bad" "refused outright"))
+         "</td>"
+         "<td>" (cond
+                  (not allowed?) (pill "bad" "n/a · never proposable")
+                  high? (pill "warn" "always · real-world actuation")
+                  (contains? governor/always-escalate-ops op)
+                  (pill "warn" "always · food-safety judgement")
+                  :else (pill "ok" (str "only below confidence "
+                                        (num governor/confidence-floor))))
+         "</td></tr>")))
+
+;; ---- section: approver attribution
+
+(defn- paths-cell [paths]
+  (if (seq paths)
+    (str/join "<br>" (map code paths))
+    (str "<span class=\"gap\">absent</span>")))
+
+(defn- attribution-row [{:keys [run approver in-record in-audit in-ledger]}]
+  (str "        <tr><td>" (code (:tid run)) "</td>"
+       "<td>" (code (kw (:op (:request run)))) "</td>"
+       "<td>" (code (:subject (:request run))) "</td>"
+       "<td>" (code approver) "</td>"
+       "<td>" (paths-cell in-record) "</td>"
+       "<td>" (paths-cell in-audit) "</td>"
+       "<td>" (paths-cell in-ledger) "</td></tr>"))
+
+(defn- attribution-note [summary]
+  (case summary
+    :ledger-keeps-approver
+    (str "<strong>Measured on this run: the durable ledger keeps the approver.</strong> "
+         "Every approved commit below carries the approving human's id into "
+         (code "store/ledger") ", so the audit trail and the durable record agree.")
+
+    :ledger-keeps-approver-partially
+    (str "<strong>Measured on this run: only SOME approved commits carry the approver "
+         "into the durable ledger.</strong> The rows below show exactly which. "
+         "Where the ledger column reads <span class=\"gap\">absent</span>, a reader of "
+         (code "store/ledger") " alone cannot tell who signed off.")
+
+    :ledger-drops-approver
+    (str "<strong>Measured on this run: the durable ledger does NOT keep the approver.</strong> "
+         "The approving human's id reaches the graph's own state (the "
+         (code ":record") " channel, written by the "
+         (code ":request-approval") " node) and the in-run audit trail, but "
+         (code "operation/commit-fact") " rebuilds the ledger entry from "
+         (code "(:value proposal)") " rather than from that channel, so the name is "
+         "dropped on the way to " (code "store/append-ledger!") ". The "
+         (code ":approval-granted") " fact is likewise never appended. "
+         "This is stated rather than silently omitted: without it a reader could not "
+         "distinguish &quot;nobody approved this&quot; from &quot;the store did not keep "
+         "who did&quot;. The table is derived by searching this run's real output for the "
+         "approver's name, so if the store is fixed the page will say so on the next build.")
+
+    :approver-absent-everywhere
+    (str "<strong>Measured on this run: the approver's id appears nowhere in the run "
+         "output.</strong> The approval gate fired, but no record of who granted it "
+         "survives anywhere the page can read.")
+
+    :no-approval-path
+    (str "<strong>This run produced no approved commit</strong>, so there is nothing to "
+         "attribute.")))
+
+;; ============================ document ============================
 
 (defn render
+  "Render the console from a completed `run-demo!` result. Reads only from
+  the store and the run records -- no literal domain values."
   [{:keys [store runs]}]
-  (let [ledger (vec (store/ledger store))
-        holds (filter hard-governor-hold? ledger)
-        rejections (filter approver-rejection? ledger)
-        approvals (for [r runs :when (approver-from-run r) f (:facts r)]
-                    [(approver-from-run r) (approver-on-record f)])
-        retained? (and (seq approvals) (every? (comp some? second) approvals))
-        attribution-lead
-        (if retained?
-          "Measured at render time: the store DOES carry the approver through onto the committed record."
-          (str "Measured at render time by scanning every fact this run appended for "
-               (str/join ", " (map #(str "<code>" (esc (kw %)) "</code>") (sort-by kw approver-keys)))
-               ": the approver is <strong>not retained on the committed record</strong> "
-               "(audit only — not retained on record). "
-               "<code>pastaops.operation</code>'s <code>:request-approval</code> node puts "
-               "<code>:approved-by</code> on the in-flight <code>:record</code>, but the "
-               "<code>:commit</code> node writes <code>commit-fact</code>, which carries the "
-               "advisor's <code>:value</code> and no approver. The approver below is read from "
-               "that run's own <code>:approval-granted</code> audit entry (keyed by thread id, "
-               "never joined on <code>[op subject]</code> — <code>batch-001</code> is the subject "
-               "of five separate runs here, so such a join would mis-attribute). "
-               "This section is derived, so it will report retention automatically once the "
-               "store keeps it."))]
+  (let [st store
+        ledger (vec (store/ledger st))
+        holds (filterv hard-hold? runs)
+        distinct-rules (->> holds (mapcat hard-rules) (remove nil?) distinct sort vec)
+        rejections (filterv human-rejection? runs)
+        commits (filterv committed? runs)
+        auto (filterv #(= :auto-commit (outcome %)) runs)
+        approvals (->> runs
+                       (filter #(= :approved (get-in % [:approval :status])))
+                       (mapv approval-attribution))
+        summary (attribution-summary approvals)
+        ops (sort-by kw (conj governor/allowed-ops :operate-extruder))]
     (str
-     "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
-     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-     "<title>cloud-itonami-isic-1074 · pastaops operator console</title>\n<style>"
-     (jp-go-dds.skin/dds+skin)
-     "</style></head><body>\n"
+     "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+     "<meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
+     "<meta name=\"color-scheme\" content=\"light\">\n"
+     "<title>Operator console · cloud-itonami-isic-1074 · macaroni, noodles &amp; couscous</title>\n"
+     "<style>\n" dds-css "\n</style>\n</head>\n<body>\n"
+
      "<header class=\"bar\">\n"
-     "  <h1>Macaroni, noodles &amp; couscous (ISIC 1074) — Operator Console</h1>\n"
-     "  <span class=\"badge\">read-only sample · governor-gated · batch logging &amp; shipment always human-approved</span>\n"
-     "</header>\n"
-     "<main>\n"
-     "  <div class=\"banner\">\n"
-     "    <p>Every row below was produced by running this repo's real actor —\n"
-     "    <code>pastaops.operation/build</code>'s compiled <code>langgraph</code> StateGraph\n"
-     "    (<code>:intake → :advise → :govern → :decide → :commit / :request-approval → :commit / :hold</code>,\n"
-     "    with a real <code>interrupt-before</code> checkpoint at the approval gate) —\n"
-     "    over <code>pastaops.store/mem-store</code>, at build time via\n"
-     "    <code>clojure -M:dev:render-html</code>. The build refuses to write this file\n"
-     "    if the run produces no HARD Governor holds.</p>\n"
-     "    <p class=\"muted\">"
-     (esc (count runs)) " scenarios · "
-     (esc (count ledger)) " durable ledger facts · "
-     (esc (count holds)) " HARD Governor holds ("
-     (esc (count (distinct (map :rule (mapcat :violations holds))))) " distinct rules) · "
-     (esc (count rejections)) " human rejections</p>\n"
-     "  </div>\n"
+     "  <h1>Macaroni, noodles, couscous &amp; similar farinaceous products (ISIC 1074) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · generated at build time from the real actor · "
+     "batch logging &amp; shipment always require a named human</span>\n"
+     "</header>\n<main>\n"
 
-     (section "Staged production batches (seed)"
-              (str "Staged with <code>store/register-batch!</code> before any run. "
-                   "<code>batch-001</code> is <code>pastaops.sim</code>'s own fixture verbatim; "
-                   "every other record is built from <code>pastaops.facts/product-types</code> "
-                   "and the jurisdiction's own <code>:required-evidence</code> list, then "
-                   "perturbed by exactly one value computed off that same product record. "
-                   "<code>batch-999</code> and <code>ghost-batch</code> are deliberately absent.")
-              ["Batch" "Product" "Jurisdiction" "Drying temp / time / moisture"
-               "Sanitation" "Declared allergens" "State after this run" "Why this record exists"]
-              (seed-rows store))
+     (section
+      "This run at a glance"
+      (str "Generated by " (code "clojure -M:dev:render-html")
+           " (" (code "pastaops.render-html")
+           "), which drives the compiled StateGraph in " (code "pastaops.operation")
+           " over a " (code "pastaops.store/MemStore") ", censored by "
+           (code "pastaops.governor") ". Every number on this page is read back out of "
+           "that run; nothing is transcribed by hand.")
+      "    <dl class=\"kv\">\n"
+      "      <dt>graph runs</dt><dd>" (count runs) "</dd>\n"
+      "      <dt>batches staged into the store</dt><dd>" (count seed-batches) "</dd>\n"
+      "      <dt>commits</dt><dd>" (count commits)
+      " <span style=\"font-weight:400\">(" (count auto)
+      " without a human, " (- (count commits) (count auto)) " human-approved)</span></dd>\n"
+      "      <dt>HARD Governor holds</dt><dd>" (count holds)
+      " <span style=\"font-weight:400\">across " (count distinct-rules)
+      " distinct rules — none reached a human</span></dd>\n"
+      "      <dt>human refusals</dt><dd>" (count rejections)
+      " <span style=\"font-weight:400\">(escalated, then declined — a different event)</span></dd>\n"
+      "      <dt>audit-ledger facts written</dt><dd>" (count ledger) "</dd>\n"
+      "    </dl>\n")
 
-     (section "Scenario runs (this build)"
-              "One graph run per row, in execution order. A HARD hold never reaches the approval gate — the interrupt does not even fire."
-              ["Thread" "Op" "Batch" "Route" "Outcome" "What it shows"]
-              (run-rows runs))
+     (section
+      "Staged production batches"
+      (str "The store's live snapshot after the run. Each measurement is shown against the "
+           "window the Governor actually compared it to, read from "
+           (code "pastaops.facts/product-types") " and "
+           (code "pastaops.facts/jurisdictions") " — the same tables the checks in "
+           (code "pastaops.registry") " are handed. Values in red are the ones that failed. "
+           "This repo's " (code "pastaops.store") " has no seed function of its own, so this "
+           "batch set is defined in the renderer and staged through the real "
+           (code "store/register-batch!") " seam; it is the run's input, and "
+           (code unregistered-batch)
+           " is deliberately never staged so the &quot;unknown batch&quot; refusal has a "
+           "real absent record to fire on.")
+      (table nil
+             ["Batch" "Product" "Jurisdiction" "Drying temp" "Drying time"
+              "Moisture" "Sanitation" "Weight var." "Allergen declaration"
+              "Evidence" "Scale calibration" "State"]
+             (mapv (partial batch-row st) seed-batches)))
 
-     (section "HARD Governor holds — refused by the Governor"
-              (str "The Governor's own <code>:violations</code> maps, verbatim. These are refusals "
-                   "the advisor cannot override and no human is asked about: "
-                   "<code>pastaops.operation</code>'s <code>:decide</code> node tests "
-                   "<code>:hard?</code> before <code>:escalate?</code>, so a hard violation "
-                   "pre-empts an op that would otherwise ALWAYS escalate.")
-              ["Thread" "Op" "Batch" "Rule" "Governor's own detail"]
-              (hold-rows runs))
+     (section
+      "Every request this run made"
+      (str "One row per graph run. &quot;Reached a human&quot; is read off the run's own "
+           (code ":approval-requested") " fact — a HARD Governor hold short-circuits at "
+           (code ":decide") " and is never shown to anyone.")
+      (table nil
+             ["Thread" "Operation" "Batch" "Advisor confidence"
+              "Reached a human?" "Outcome"]
+             (mapv run-row runs)))
 
-     (section "Human approval rejections — a person refused"
-              (str "Kept in a separate table on purpose. These holds are written through the same "
-                   "<code>governor/hold-fact</code> path and carry a <code>:violations</code> entry "
-                   "(<code>:approver-rejected</code>), so a naive count of holds would mix them in "
-                   "with Governor refusals. They are not: the Governor found nothing wrong and "
-                   "escalated; the operator declined.")
-              ["Thread" "Op" "Batch" "Operator" "Advisor confidence" "Reading"]
-              (rejection-rows runs))
+     (section
+      (str "Governor HARD refusals — " (count holds) " holds, "
+           (count distinct-rules) " distinct rules")
+      (str "These are refusals by the independent Governor. They cannot be overridden by "
+           "advisor confidence and they never reach a human for sign-off. Rule names and "
+           "detail text are taken verbatim from the verdict each run produced.")
+      (table nil
+             ["Thread" "Operation" "Batch" "Rule" "Why the Governor refused"]
+             (mapv hold-row holds)))
 
-     (section "Action gate (Pasta Governor)"
-              (str "Derived at render time from <code>pastaops.governor/allowed-ops</code>, "
-                   "<code>high-stakes</code>, <code>always-escalate-ops</code> and "
-                   "<code>confidence-floor</code>. Any op outside this closed allowlist — "
-                   "extrusion/drying-line control, food-safety certification — is a permanent "
-                   "hard block (see thread <code>t19</code>).")
-              ["Op" "Gate"]
-              (gate-rows))
+     (section
+      "Human sign-off gate — separate from the refusals above"
+      (str "A HARD refusal and an escalation are different events: the first means the "
+           "Governor would not let the proposal through at all, the second means it was "
+           "clean enough to put in front of a person. This table is read live off "
+           (code "pastaops.governor") "'s own vars ("
+           (code "allowed-ops") ", " (code "high-stakes") ", "
+           (code "always-escalate-ops") ", " (code "confidence-floor")
+           "), so it cannot drift from the code. "
+           (code ":operate-extruder")
+           " is included to show what the closed allowlist does with an operation this "
+           "actor has no authority to propose at all. Note that "
+           (code "pastaops.phase")
+           " exists in this repo but is not referenced by any other namespace in "
+           (code "src/") ", so there is no phase-based rollout gate to report here.")
+      (table nil
+             ["Operation" "In the closed allowlist?" "Needs a named human?"]
+             (mapv gate-row ops)))
 
-     (section "Audit ledger (this run)"
-              (str "<code>pastaops.store/append-ledger!</code>, in append order — written by the "
-                   "graph's own <code>:commit</code> and <code>:hold</code> nodes, not by this renderer.")
-              ["Fact" "Op" "Batch" "Actor" "Disposition" "Basis"]
-              (ledger-rows ledger))
+     (section
+      "Who approved what"
+      (attribution-note summary)
+      (table nil
+             ["Thread" "Operation" "Batch" "Approver"
+              "…in the graph's record channel" "…in the in-run audit trail"
+              "…in the durable ledger"]
+             (mapv attribution-row approvals)))
 
-     (section "Approver attribution" attribution-lead
-              ["Thread" "Fact" "Batch" "Operator who signed off" "On the durable record?"]
-              (attribution-rows runs))
+     (section
+      (str "Audit ledger — " (count ledger) " facts")
+      (str "The append-only decision log this run wrote through "
+           (code "store/append-ledger!") ", in append order. "
+           "Basis is the citation set for a commit and the violated rule list for a hold.")
+      (table nil
+             ["#" "Fact" "Operation" "Batch" "Disposition" "Basis"]
+             (vec
+              (map-indexed
+               (fn [i {:keys [t op subject disposition basis]}]
+                 (str "        <tr><td class=\"n\">" (inc i) "</td>"
+                      "<td>" (code (kw t)) "</td>"
+                      "<td>" (code (kw op)) "</td>"
+                      "<td>" (code subject) "</td>"
+                      "<td>" (if (= :commit disposition)
+                               (pill "ok" (kw disposition))
+                               (pill "bad" (kw disposition))) "</td>"
+                      "<td>" (esc (str/join ", "
+                                            (map (fn [b]
+                                                   (if (map? b) (:spec b) (kw b)))
+                                                 basis)))
+                      "</td></tr>"))
+               ledger))))
 
-     "</main>\n"
-     "<footer>\n"
-     "  <p>Generated by <code>pastaops.render-html</code> (<code>clojure -M:dev:render-html</code>) from a live actor run. "
-     "No timestamps, no randomness — re-running against the same seed produces a byte-identical file.</p>\n"
-     "</footer>\n"
-     "</body></html>\n")))
+     "</main>\n<footer>\n"
+     "  Regenerate with <code>clojure -M:dev:render-html</code>. The page contains no "
+     "timestamps and no wall-clock-derived values, so two runs from the same seed are "
+     "byte-identical. Design tokens: jp-go-digital-design-system (MIT, © 2025 デジタル庁).\n"
+     "</footer>\n</body>\n</html>\n")))
 
-;; ----------------------------- build-time invariant -----------------------------
+;; ============================ entry point ============================
 
-(defn check-run!
-  "Refuse to produce a console unless the run really exercised the
-  Governor. Throws (never writes) when:
-    1. the run produced ZERO HARD Governor holds, or
-    2. any scenario reached a disposition other than the one it declares,
-       or
-    3. a scenario declaring an approval never actually interrupted (i.e.
-       the human-in-the-loop gate silently stopped gating).
-  Returns the run map unchanged."
-  [{:keys [store runs] :as run}]
-  (let [ledger (vec (store/ledger store))
-        holds (filterv hard-governor-hold? ledger)
-        mismatched (filterv #(not= (:expect %) (:disposition %)) runs)
-        ungated (filterv #(and (:approval %) (not (:interrupted? %))) runs)]
+(defn- assert-hard-holds!
+  "Build-time invariant, not a convention. A console that shows only happy
+  paths is worthless as evidence that the Governor can refuse, so refuse to
+  write one.
+
+  Two stages, because one is not enough: a phase- or approval-gated hold can
+  legitimately carry an EMPTY `:violations` vector and would satisfy a naive
+  count of holds while telling the reader nothing. So this requires both that
+  HARD holds happened AND that at least one of them carries a real rule with a
+  real reason."
+  [runs]
+  (let [holds (filterv hard-hold? runs)
+        substantive (filterv substantive-hard-hold? runs)]
     (when (empty? holds)
-      (throw (ex-info "refusing to write a console with zero HARD governor holds"
-                      {:ledger-facts (count ledger) :scenarios (count runs)})))
-    (when (seq mismatched)
-      (throw (ex-info "refusing to write a console: scenario dispositions do not match"
-                      {:mismatched (mapv #(select-keys % [:id :expect :disposition]) mismatched)})))
-    (when (seq ungated)
-      (throw (ex-info "refusing to write a console: an approval scenario never interrupted"
-                      {:ungated (mapv :id ungated)})))
-    run))
+      (throw (ex-info "refusing to write the console: this run produced ZERO HARD governor holds"
+                      {:runs (count runs) :hard-holds 0})))
+    (when (empty? substantive)
+      (throw (ex-info (str "refusing to write the console: " (count holds)
+                           " HARD hold(s), but none carries a violation rule with a reason")
+                      {:runs (count runs)
+                       :hard-holds (count holds)
+                       :substantive-hard-holds 0})))
+    {:hard-holds (count holds)
+     :substantive (count substantive)
+     :distinct-rules (->> holds (mapcat hard-rules) (remove nil?) distinct sort vec)}))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
-        result (check-run! (run-demo!))
-        ledger (vec (store/ledger (:store result)))
-        holds (filterv hard-governor-hold? ledger)
-        html (render result)]
-    (when-let [dir (.getParentFile (java.io.File. ^String out))]
-      (.mkdirs dir))
+        {:keys [store runs] :as demo} (run-demo!)
+        {:keys [hard-holds distinct-rules]} (assert-hard-holds! runs)
+        html (render demo)]
+    (some-> (.getParentFile (java.io.File. ^String out)) .mkdirs)
     (spit out html)
     (println "wrote" out
-             (str "(" (count (:runs result)) " scenarios, "
-                  (count ledger) " ledger facts, "
-                  (count holds) " HARD governor holds over "
-                  (count (distinct (map :rule (mapcat :violations holds)))) " distinct rules, "
-                  (count (filterv approver-rejection? ledger)) " human rejections)"))))
+             (str "(" (count html) " bytes, "
+                  (count runs) " graph runs, "
+                  (count (store/ledger store)) " ledger facts, "
+                  hard-holds " HARD holds over "
+                  (count distinct-rules) " distinct rules)"))
+    (println "  hard-hold rules:" (str/join " " (map name distinct-rules)))))
