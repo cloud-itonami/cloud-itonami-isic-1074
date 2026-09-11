@@ -7,7 +7,7 @@
   `pastaops.operation/build` (a genuinely compiled `langgraph.graph`
   StateGraph) -> `pastaops.advisor` -> `pastaops.governor` ->
   `pastaops.store` -- driven through `langgraph.graph/run*` exactly the
-  way `pastaops.sim` and `test/pastaops/operation_graph_test.cljc` drive
+  way `pastaops.sim` and `test/pastaops/operation_graph_test.cljk` drive
   it, including real `interrupt-before` checkpoint/resume for the
   human-in-the-loop approval gate. Nothing on the page is hand-typed
   HTML describing behaviour: the batch table is `store/snapshot`, the
@@ -59,7 +59,7 @@
 
 (def ^:private clean-batch
   "Verbatim copy of `pastaops.sim`'s own `clean-batch` fixture (which is
-  itself mirrored by `test/pastaops/operation_test.cljc` and
+  itself mirrored by `test/pastaops/operation_test.cljk` and
   `operation_graph_test.cljc`): clean against every independent Governor
   check."
   {:product-type :macaroni/elbow

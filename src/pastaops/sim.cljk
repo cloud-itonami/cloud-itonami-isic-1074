@@ -15,7 +15,7 @@
   "A batch record clean against every independent Governor check
   (spec-basis, evidence-completeness, drying-temp/time, moisture,
   sanitation, allergen-label). Mirrors
-  `test/pastaops/operation_test.cljc`'s `clean-batch` fixture."
+  `test/pastaops/operation_test.cljk`'s `clean-batch` fixture."
   {:product-type :macaroni/elbow
    :jurisdiction :jp/prefectural
    :drying-temp-c 85
