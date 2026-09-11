@@ -48,5 +48,5 @@
  now also exposes a `Store` protocol (`MemStore`) alongside its original
  pure `{:batches ...}` value helpers (unchanged, still used directly by
  `pastaops.governor`'s independent checks). 47 tests / 173 assertions
- green (`clojure -M:dev:test`), clj-kondo 0 errors, demo runnable
- end-to-end (`clojure -M:dev:run`)."}
+ green (`kbb -M:dev:test`), clj-kondo 0 errors, demo runnable
+ end-to-end (`kbb -M:dev:run`)."}

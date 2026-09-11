@@ -17,7 +17,7 @@ human-in-the-loop resume for the two real actuation events
 concern flagging. Every commit/hold/approval-rejected decision fact is
 appended to `pastaops.store`'s append-only audit ledger
 (`ledger`/`append-ledger!`, `MemStore`). The demo runner
-(`clojure -M:dev:run`) drives the compiled graph end-to-end through a
+(`kbb -M:dev:run`) drives the compiled graph end-to-end through a
 commit path, an escalate→approve→commit path, an escalate→reject→hold
 path, and a hard-hold path, printing the resulting audit ledger.
 
@@ -102,14 +102,14 @@ Mirrors `cloud-itonami-isic-1071` (`bakeryops.*`) module-for-module:
   :design -> :produce -> :inspect -> :package -> :audit -> :archived`),
   independent of the operation StateGraph above (it does not gate
   auto-commit; it tracks where a batch physically is in production)
-- `pastaops.sim` — demo runner (`clojure -M:dev:run`)
+- `pastaops.sim` — demo runner (`kbb -M:dev:run`)
 
 ## Testing
 
 ```bash
-clojure -M:dev:test   # run the test suite (langgraph resolved via local sibling checkout)
-clojure -M:lint       # clj-kondo, 0 errors / 0 warnings
-clojure -M:dev:run    # demo runner -- drives the compiled StateGraph end-to-end
+kbb -M:dev:test   # run the test suite (langgraph resolved via local sibling checkout)
+kbb -M:lint       # clj-kondo, 0 errors / 0 warnings
+kbb -M:dev:run    # demo runner -- drives the compiled StateGraph end-to-end
 ```
 
 `:dev` pins the transitive `langchain` dependency to the in-monorepo local

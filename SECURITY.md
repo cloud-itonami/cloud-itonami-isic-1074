@@ -34,7 +34,7 @@ Security-critical concerns:
 
 All Governor changes must:
 - Have comprehensive test coverage (facts, registry, governor rules)
-- Pass `clojure -M:test` and `clojure -M:lint`
+- Pass `kbb -M:test` and `kbb -M:lint`
 - Include documentation of the food-safety rationale
 
 ## Dependencies
