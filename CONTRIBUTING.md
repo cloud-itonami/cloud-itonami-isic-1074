@@ -28,8 +28,8 @@ Do **not**:
 1. Open an issue describing your proposed change
 2. Link to the relevant ADR (see the parent `kotoba-lang/industry` repository)
 3. Submit a pull request against `main`
-4. Ensure all tests pass: `clojure -M:test`
-5. Run linter: `clojure -M:lint`
+4. Ensure all tests pass: `kbb -M:test`
+5. Run linter: `kbb -M:lint`
 
 ## Code Style
 
