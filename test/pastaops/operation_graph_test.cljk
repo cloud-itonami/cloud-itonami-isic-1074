@@ -5,7 +5,7 @@
   escalate-reject routes. These did not exist before: there was no
   `build` at all, no Advisor node, and `store/append-ledger!` had never
   been called from any real commit/hold path (only from
-  `test/pastaops/store_test.cljc` setup code).
+  `test/pastaops/store_test.cljk` setup code).
 
   Falsifiable claims each test proves, not just asserts:
     1. the ledger is verified EMPTY before the run (never pre-populated
@@ -34,7 +34,7 @@
 (def ^:private clean-batch
   "Governor-clean against every independent hard check (spec-basis,
   evidence-completeness, drying-temp/time, moisture, sanitation,
-  allergen-label). Mirrors `test/pastaops/operation_test.cljc`'s fixture
+  allergen-label). Mirrors `test/pastaops/operation_test.cljk`'s fixture
   of the same name."
   {:product-type :macaroni/elbow
    :jurisdiction :jp/prefectural

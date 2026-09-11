@@ -37,7 +37,7 @@
  (real actuation) and `:flag-food-safety-concern` (food-safety, never
  auto-resolved by confidence) ALWAYS escalate to a human plant operator
  via the compiled graph's `:request-approval` node (checkpoint-based
- resume), proven end-to-end by `test/pastaops/operation_graph_test.cljc`
+ resume), proven end-to-end by `test/pastaops/operation_graph_test.cljk`
  exercising commit / hard-hold (batch never staged, and a HARD
  drying-temp violation that pre-empts what would otherwise be an
  always-escalate op) / escalate-approve / escalate-reject / coordinate-

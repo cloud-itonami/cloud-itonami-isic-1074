@@ -34,7 +34,7 @@
        (`pastaops.advisor/Advisor`), has a real mock implementation, and
        is genuinely a node inside the compiled graph below.
     3. `pastaops.store/append-fact` (the ledger-append function) existed
-       but was called ONLY from `test/pastaops/store_test.cljc` test
+       but was called ONLY from `test/pastaops/store_test.cljk` test
        setup -- never from any real commit/hold path, since there was no
        real commit/hold path (`run-operation` above never appends
        anything to a store; it just returns facts to the caller). Fixed:
