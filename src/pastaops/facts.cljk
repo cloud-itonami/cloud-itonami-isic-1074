@@ -15,7 +15,7 @@
   moisture windows are primarily a quality/texture concern, here excess
   post-drying moisture is itself the primary food-safety hazard this
   Governor exists to catch."
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 (def product-types
   "Valid macaroni/noodle/couscous product categories and their safe
