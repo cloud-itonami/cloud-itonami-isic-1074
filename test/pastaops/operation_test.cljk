@@ -1,5 +1,5 @@
 (ns pastaops.operation-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [pastaops.operation :as operation]
             [pastaops.governor :as governor]))
 

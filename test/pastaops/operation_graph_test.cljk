@@ -23,7 +23,7 @@
        run time (impossible to have been hardcoded anywhere in
        `pastaops.operation`) and asserting the committed ledger fact
        carries that EXACT string."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [pastaops.advisor :as advisor]
             [pastaops.operation :as operation]
