@@ -1,5 +1,5 @@
 (ns pastaops.phase-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [pastaops.phase :as phase]))
 
 ;; ──────────────────────── Phase Validity ──────────────────────

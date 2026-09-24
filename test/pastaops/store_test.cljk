@@ -1,5 +1,5 @@
 (ns pastaops.store-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [pastaops.store :as store]))
 
 ;; ──────────────────────── Batch Retrieval ──────────────────────

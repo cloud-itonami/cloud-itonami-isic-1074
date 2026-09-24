@@ -1,5 +1,5 @@
 (ns pastaops.registry-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [pastaops.registry :as registry]))
 
 ;; ──────────────────────── Drying Temperature Safety ──────────────────────
