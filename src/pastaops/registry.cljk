@@ -9,7 +9,7 @@
   Clojure/ClojureScript. Callers that need the current time (see
   `scale-calibration-overdue?`) obtain it themselves via a `:clj`/`:cljs`
   reader-conditional at the call site (see `pastaops.governor`)."
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 (defn drying-temp-out-of-range?
   "Independently verify that the batch's actual drying temperature stays
