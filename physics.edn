@@ -1,0 +1,22 @@
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-1074"
+ :cases
+ [{:id :noodle-cook
+   :kind :thermal
+   :procedure "fresh noodle strands (2 mm) pass through the continuous boiling-water cooker; the strand core must reach starch gelatinisation"
+   :params {:thickness-m 0.001 :conductivity-w-mk 0.50 :density-kg-m3 1100.0 :specific-heat-j-kgk 3000.0
+            :t0-c 20.0 :t-hot-c 98.0 :h-front-w-m2k 1000.0 :h-back-w-m2k 0.0 :t-back-ambient-c 20.0
+            :threshold-c 70.0 :nodes 11}
+   :sweep {:param :duration-s :values [2.0 4.0 6.0 10.0 20.0]}
+   :quantity :final-back-c
+   :limit {:min 70.0 :basis "estimate: wheat-starch gelatinisation is complete around 65-70 C; take 70 C at the strand core"}
+   :boundary {:lo 0.5 :hi 60.0}}
+  {:id :pasta-carton-lift
+   :kind :manipulator
+   :procedure "arm lifts a packed pasta carton from the case packer onto the pallet"
+   :params {:l1-m 0.70 :l2-m 0.60 :m1-kg 12.0 :m2-kg 8.0
+            :from [0.70 0.0] :to [0.20 0.90] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [5.0 10.0 15.0 20.0 25.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 300.0 :basis "estimate: continuous shoulder torque of a ~25 kg payload palletizing arm"}
+   :boundary {:lo 1.0 :hi 80.0}}]}
